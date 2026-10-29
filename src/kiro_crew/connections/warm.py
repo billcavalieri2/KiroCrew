@@ -55,11 +55,14 @@ every point: a handle is REGISTERED in ``_sessions`` before anything can be inte
 FORGOTTEN only once its destroy has completed -- so an interrupted teardown leaves a record
 the ordinary sweep retries. The create is run as a shielded task so its handle stays
 reachable even when the wait for it is abandoned
-(:meth:`_WarmMintRuntime._abandon_session_creation_locked`). When no handle can be recovered
-at all the generation is QUARANTINED rather than trusted to retire on its own, which bounds
-the unaddressable residual to one generation's sessions -- retirement is not guaranteed to
-arrive, because a card holding a URL keeps the reaper's idle clock reset while the digest fast
-path keeps the same process reusable.
+(:meth:`_WarmMintRuntime._abandon_session_creation_locked`). When the create is still in
+flight and no handle can be recovered the generation is QUARANTINED rather than trusted to
+retire on its own, which bounds the unaddressable residual to one generation's sessions --
+retirement is not guaranteed to arrive, because a card holding a URL keeps the reaper's idle
+clock reset while the digest fast path keeps the same process reusable. A create that instead
+finished by RAISING accepted no session, so it strands nothing and must NOT quarantine: doing
+so would tear down a generation still serving other cards' verifiers over a clean activation
+failure that activation already degrades past on the cold path.
 
 LIVENESS is asked of the parked list too. A generation keeps its NUMBER while parked -- only
 a successful spawn bumps the counter -- so ``generation_is_live`` uses the equality test to
@@ -1082,8 +1085,22 @@ class _WarmMintRuntime:
         except BaseException:  # noqa: BLE001 — best-effort reap; the caller re-raises its own
             handle = None
         if handle is None:
-            # Nothing addressable exists to destroy: the backend may still accept a session
-            # carrying an id we never received. QUARANTINE the generation rather than trust
+            if create.done() and not create.cancelled() and create.exception() is not None:
+                # ``session/new`` RAISED, so the backend never accepted a session on this
+                # create: ``create_session`` owns its own teardown on every raising path (a
+                # start timeout is held by the ``StartCollector`` and, with no late adopter
+                # here, torn down; an earlier failure created nothing at all). No session
+                # carries an id we never received, so this generation strands nothing.
+                # Quarantining would stand down a generation still holding other cards' live
+                # verifiers -- including an in-flight OAuth loopback listener answering a
+                # redirect -- for a failure that left no orphan, which sends that redirect to a
+                # dead address and fails the approval. Return
+                # and let the caller re-raise, so activation degrades to the cold path with
+                # the generation and its verifiers intact.
+                return
+            # The create is still in flight (our reap timed out too) or was cancelled before
+            # it settled, so the backend may still accept a session carrying an id we never
+            # received. QUARANTINE the generation rather than trust
             # retirement to arrive on its own -- it is not guaranteed to. Any card holding a
             # URL keeps ``_shared_mints_pending`` true, which resets the reaper's idle clock
             # every cycle, while ``_ensure_locked``'s digest fast path keeps this same
