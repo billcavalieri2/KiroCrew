@@ -826,6 +826,42 @@ async def test_a_recovered_handle_does_not_quarantine_the_generation(
     assert warm._warm_mint._digest == resident.digest
 
 
+@pytest.mark.asyncio
+async def test_a_create_that_raises_does_not_quarantine_the_generation(
+    monkeypatch: pytest.MonkeyPatch, _agents_dir: Path
+):
+    """A ``session/new`` that RAISES accepted no session, so it strands nothing: the generation
+    must stay intact and keep serving other cards' live verifiers. Quarantining a clean
+    activation failure tears down an in-flight OAuth loopback listener, sending its redirect
+    to a dead address and failing the approval."""
+    from kiro_crew.acp.session_handle_runtime_contract import AcpRuntimeError
+
+    # Long enough that the warm wait does NOT win the race: the create settles by raising first,
+    # so this exercises the raised-create branch rather than the still-in-flight timeout.
+    monkeypatch.setattr(warm, "_WARM_SESSION_TIMEOUT_SECONDS", 5.0)
+    monkeypatch.setattr(warm, "_WARM_SESSION_REAP_TIMEOUT_SECONDS", 5.0)
+
+    class _RaisesOnCreate:
+        def is_alive(self) -> bool:
+            return True
+
+        async def create_session(self, **kwargs):
+            raise AcpRuntimeError("session/new refused")
+
+    resident = warm._warm_spec_plan([_provider("linear")])
+    monkeypatch.setattr(warm._warm_mint, "_runtime", _RaisesOnCreate())
+    monkeypatch.setattr(warm._warm_mint, "_generation", 5)
+    monkeypatch.setattr(warm._warm_mint, "_plan", resident)
+    monkeypatch.setattr(warm._warm_mint, "_digest", resident.digest)
+    monkeypatch.setattr(warm._warm_mint, "_sessions", {})
+
+    with pytest.raises(AcpRuntimeError):
+        await warm._warm_mint._activate_locked("agent", frozenset())
+
+    assert warm._warm_mint._plan is resident, "a raised create must NOT quarantine the generation"
+    assert warm._warm_mint._digest == resident.digest
+
+
 # ── defect: the settle loop never CONSUMED the session queue ──
 #
 # `pop_pending_oauth_requests()` reads a list that only `drain_init` appends to, and
